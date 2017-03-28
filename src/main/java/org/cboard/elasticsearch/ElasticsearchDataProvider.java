@@ -3,15 +3,20 @@ package org.cboard.elasticsearch;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastjson.JSONPath;
 import com.google.common.base.Charsets;
 import com.google.common.hash.Hashing;
 import org.apache.commons.collections.keyvalue.DefaultMapEntry;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpResponse;
 import org.apache.http.client.fluent.Request;
 import org.apache.http.entity.ContentType;
+import org.apache.http.util.EntityUtils;
 import org.cboard.cache.CacheManager;
 import org.cboard.cache.HeapCacheManager;
-import org.cboard.dataprovider.aggregator.Aggregatable;
 import org.cboard.dataprovider.DataProvider;
+import org.cboard.dataprovider.Initializing;
+import org.cboard.dataprovider.aggregator.Aggregatable;
 import org.cboard.dataprovider.annotation.DatasourceParameter;
 import org.cboard.dataprovider.annotation.ProviderName;
 import org.cboard.dataprovider.annotation.QueryParameter;
@@ -23,7 +28,6 @@ import org.cboard.dataprovider.result.ColumnIndex;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -36,29 +40,27 @@ import java.util.stream.Stream;
  * Created by yfyuan on 2017/3/17.
  */
 @ProviderName(name = "Elasticsearch")
-public class ElasticsearchDataProvider extends DataProvider implements Aggregatable {
+public class ElasticsearchDataProvider extends DataProvider implements Aggregatable, Initializing {
 
     private static final Logger LOG = LoggerFactory.getLogger(ElasticsearchDataProvider.class);
 
     @DatasourceParameter(label = "Elasticsearch Server (domain:port)", type = DatasourceParameter.Type.Input, order = 1)
-    private String SERVERIP = "serverIp";
+    protected String SERVERIP = "serverIp";
 
     @QueryParameter(label = "Index", type = QueryParameter.Type.Input, order = 2)
-    private String INDEX = "index";
+    protected String INDEX = "index";
 
     @QueryParameter(label = "Type", type = QueryParameter.Type.Input, order = 3)
-    private String TYPE = "type";
+    protected String TYPE = "type";
+
+    @QueryParameter(label = "Override Aggregations", type = QueryParameter.Type.TextArea, order = 6)
+    private String OVERRIDE = "override";
+
+    private JSONObject overrideAggregations = new JSONObject();
 
     private static final CacheManager<Map<String, String>> typesCache = new HeapCacheManager<>();
 
-
-    public ElasticsearchDataProvider() {
-
-    }
-
-    public ElasticsearchDataProvider(Map<String, String> dataSource, Map<String, String> query) {
-        super(dataSource, query);
-    }
+    private static final JSONPath jsonPath_value = JSONPath.compile("$..value");
 
     @Override
     public String[][] queryDimVals(String columnName, AggConfig config) throws Exception {
@@ -166,25 +168,49 @@ public class ElasticsearchDataProvider extends DataProvider implements Aggregata
         return result;
     }
 
-    private JSONObject post(String url, JSONObject request) throws IOException {
-        String response = Request.Post(url).bodyString(request.toString(), ContentType.APPLICATION_JSON).execute().returnContent().asString();
+    protected JSONObject post(String url, JSONObject request) throws Exception {
+        HttpResponse httpResponse = Request.Post(url).bodyString(request.toString(), ContentType.APPLICATION_JSON).execute().returnResponse();
+        String response = EntityUtils.toString(httpResponse.getEntity());
+        if (httpResponse.getStatusLine().getStatusCode() == 200) {
+            return JSONObject.parseObject(response);
+        } else {
+            throw new Exception(response);
+        }
+    }
+
+    protected JSONObject get(String url) throws Exception {
+        String response = Request.Get(url).execute().returnContent().asString();
         return JSONObject.parseObject(response);
     }
 
-    private JSONObject getTermsAggregation(String columnName) {
-        JSONObject aggregation = new JSONObject();
-        aggregation.put(columnName, new JSONObject());
-        aggregation.getJSONObject(columnName).put("terms", new JSONObject());
-        aggregation.getJSONObject(columnName).getJSONObject("terms").put("field", columnName);
-        aggregation.getJSONObject(columnName).getJSONObject("terms").put("size", 1000);
-        return aggregation;
+    private JSONObject getOverrideTermsAggregation(String columnName) {
+        if (overrideAggregations.containsKey(columnName)) {
+            JSONObject override = new JSONObject();
+            override.put(columnName, overrideAggregations.getJSONObject(columnName));
+            return override;
+        }
+        return null;
     }
 
-    private String getMappingUrl() {
+    protected JSONObject getTermsAggregation(String columnName) {
+        JSONObject result = getOverrideTermsAggregation(columnName);
+        if (result != null) {
+            return result;
+        } else {
+            JSONObject aggregation = new JSONObject();
+            aggregation.put(columnName, new JSONObject());
+            aggregation.getJSONObject(columnName).put("terms", new JSONObject());
+            aggregation.getJSONObject(columnName).getJSONObject("terms").put("field", columnName);
+            aggregation.getJSONObject(columnName).getJSONObject("terms").put("size", 1000);
+            return aggregation;
+        }
+    }
+
+    protected String getMappingUrl() {
         return String.format("http://%s/%s/_mapping/%s", dataSource.get(SERVERIP), query.get(INDEX), query.get(TYPE));
     }
 
-    private String getSearchUrl() {
+    protected String getSearchUrl() {
         return String.format("http://%s/%s/_search", dataSource.get(SERVERIP), query.get(INDEX));
     }
 
@@ -201,9 +227,8 @@ public class ElasticsearchDataProvider extends DataProvider implements Aggregata
             synchronized (key.intern()) {
                 types = typesCache.get(key);
                 if (types == null) {
-                    String mappingJson = Request.Get(getMappingUrl()).execute().returnContent().asString();
-                    JSONObject mapping = JSONObject.parseObject(mappingJson);
-                    mapping = mapping.getJSONObject(query.get(INDEX)).getJSONObject("mappings").getJSONObject(query.get(TYPE));
+                    JSONObject mapping = get(getMappingUrl());
+                    mapping = mapping.getJSONObject(mapping.keySet().iterator().next()).getJSONObject("mappings").getJSONObject(query.get(TYPE));
                     types = new HashMap<>();
                     getField(types, new DefaultMapEntry(null, mapping), null);
                     typesCache.put(key, types, 1 * 60 * 60 * 1000);
@@ -215,6 +240,7 @@ public class ElasticsearchDataProvider extends DataProvider implements Aggregata
 
     @Override
     public AggregateResult queryAggData(AggConfig config) throws Exception {
+        LOG.info("queryAggData");
         JSONObject request = getQueryAggDataRequest(config);
         JSONObject response = post(getSearchUrl(), request);
         Stream<DimensionConfig> dimStream = Stream.concat(config.getColumns().stream(), config.getRows().stream());
@@ -258,13 +284,14 @@ public class ElasticsearchDataProvider extends DataProvider implements Aggregata
             keys.addAll(parentKeys);
         }
         if (dimensionLevel > 0) {
-            keys.add(object.getString("key"));
+            keys.add(object.getOrDefault("key_as_string", object.getString("key")).toString());
         }
         if (dimensionLevel >= dimensionList.size()) {
             for (ColumnIndex value : valueList) {
                 String valueKey = getAggregationName(value.getAggType(), value.getName());
-                String _value = object.getJSONObject(valueKey).getString("value");
-                keys.add(_value);
+                JSONObject valueObject = object.getJSONObject(valueKey);
+                List<Object> values = (List<Object>) jsonPath_value.eval(valueObject);
+                keys.add("" + values.get(0));
             }
             result.add(keys.toArray(new String[keys.size()]));
         } else {
@@ -303,13 +330,28 @@ public class ElasticsearchDataProvider extends DataProvider implements Aggregata
                     break;
             }
             aggregation.put(aggregationName, new JSONObject());
-            aggregation.getJSONObject(aggregationName).put(type, new JSONObject());
             if (typesCache.containsKey(config.getColumn())) {
+                aggregation.getJSONObject(aggregationName).put(type, new JSONObject());
                 aggregation.getJSONObject(aggregationName).getJSONObject(type).put("field", config.getColumn());
             } else {
-                JSONObject script = new JSONObject();
-                script.put("inline", config.getColumn());
-                aggregation.getJSONObject(aggregationName).getJSONObject(type).put("script", script);
+                JSONObject extend = JSONObject.parseObject(config.getColumn());
+                String column = extend.getString("column");
+                JSONObject filter = extend.getJSONObject("filter");
+                JSONObject script = extend.getJSONObject("script");
+                JSONObject _aggregations = aggregation.getJSONObject(aggregationName);
+                if (filter != null) {
+                    _aggregations.put("filter", filter);
+                    _aggregations.put("aggregations", new JSONObject());
+                    _aggregations.getJSONObject("aggregations").put("agg_value", new JSONObject());
+                    _aggregations = _aggregations.getJSONObject("aggregations").getJSONObject("agg_value");
+                }
+                _aggregations.put(type, new JSONObject());
+                _aggregations = _aggregations.getJSONObject(type);
+                if (script != null) {
+                    _aggregations.put("script", script);
+                } else {
+                    _aggregations.put("field", column);
+                }
             }
         });
         return aggregation;
@@ -344,5 +386,13 @@ public class ElasticsearchDataProvider extends DataProvider implements Aggregata
         String format = "curl -XPOST '%s?pretty' -d '\n%s'";
         String dsl = JSON.toJSONString(getQueryAggDataRequest(ac), true);
         return String.format(format, getSearchUrl(), dsl);
+    }
+
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        if (StringUtils.isNotBlank(query.get(OVERRIDE))) {
+            overrideAggregations = JSONObject.parseObject(query.get(OVERRIDE));
+        }
     }
 }
